@@ -75,6 +75,8 @@
 
 import re
 import time
+from dotenv import load_dotenv
+load_dotenv()
 import shutil
 import os
 import glob
@@ -88,13 +90,13 @@ from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 
 # ── ★ 설정 ★ ──────────────────────────────────────────────
-LOGIN_ID      = input("ID를 입력하세요:")        # 로그인 아이디
-LOGIN_PW      = input('비밀번호를 입력하세요:')   # 로그인 비밀번호
+LOGIN_ID      = os.getenv("KOLAS_ID") or input("ID를 입력하세요: ")
+LOGIN_PW      = os.getenv("KOLAS_PW") or input("비밀번호를 입력하세요: ")
 BASE_URL      = "https://www.knab.go.kr"
 LOGIN_URL     = "https://www.knab.go.kr/mgr/intr/lgn/LoginMngCpinsForm.do"
 TEMPLATE_FILE = "template.xlsx"    # 양식 파일 (스크립트와 같은 폴더)
 OUTPUT_DIR    = "ahnhyoseung"      # 결과 저장 폴더
-DOWNLOAD_DIR  = r"C:\Users\user\Downloads"  # 인정분야 xls 다운로드 경로
+DOWNLOAD_DIR  = os.getenv("DOWNLOAD_DIR") or r"C:\Users\user\Downloads"
 # ──────────────────────────────────────────────────────────
 
 # 기관이력 팝업에서 찾을 신청분류 키워드 (이 중 하나 포함된 행 선택)
@@ -260,20 +262,13 @@ def collect_list(driver):
 # ════════════════════════════════════════════════════════════
 def get_history_evaluators(driver, accredit_no):
     """
-    기관이력보기 팝업에서 직전 평가반 성명 수집.
-    버튼: <input type="button" value="기관이력보기" onclick="OfcwbRcepPopUp('accreditNo');">
-
-    동작:
-    1. 이력 목록에서 HISTORY_KEYWORDS(정기/신규/재평가/확대) 포함 최상단 행 클릭
-    2. 이력 상세에서 진행단계="현장평가" + 처리상태="처리완료" 행 찾기
-    3. 현장평가 상세에서 평가반 성명 수집
-       - 구분 키워드: 반장, 평가사, 사보, 위원, 평가원
-       - 테이블 구조: cells[0]=구분, cells[1]=소속, cells[2]=성명
+    기관이력보기 팝업 → 이력 행 클릭 → 현장평가 행 평가계획서 클릭 → 평가반 수집
+    팝업을 닫지 않고 연속 클릭으로 처리 (POST 방식 페이지라 URL 직접 접근 불가)
     """
     evaluators = []
     main_window = driver.current_window_handle
 
-    # 기관이력보기 버튼 클릭
+    # 1. 기관이력보기 팝업 열기
     clicked = click_btn(
         driver,
         "//a[contains(text(),'기관이력보기')]",
@@ -281,19 +276,17 @@ def get_history_evaluators(driver, accredit_no):
         "//button[contains(text(),'기관이력보기')]"
     )
     if not clicked:
-        # 버튼 못 찾으면 URL 직접 열기 시도
         url = f"{BASE_URL}/mgr/rcj/doj/OfcwbRcepPopUpList.do?accreditNo={accredit_no}"
         driver.execute_script(f"window.open('{url}', '_blank')")
 
-    popup = switch_to_popup(driver, main_window)
-    if not popup:
+    popup1 = switch_to_popup(driver, main_window)
+    if not popup1:
         print("  ⚠️ 기관이력 팝업 열리지 않음")
         return evaluators
-
     time.sleep(1.5)
 
-    # 이력 목록에서 정기/신규/재평가/확대 포함 최상단 행 클릭
-    target_href = None
+    # 2. 이력 목록에서 HISTORY_KEYWORDS 포함 최상단 행 접수번호 클릭
+    # HistoryInfo()는 새 창을 열음
     try:
         rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
         for row in rows:
@@ -302,76 +295,75 @@ def get_history_evaluators(driver, accredit_no):
             if any(kw in row_text for kw in HISTORY_KEYWORDS):
                 try:
                     link = row.find_element(By.CSS_SELECTOR, "td a")
-                    target_href = link.get_attribute("href")
-                    print(f"  📎 이력 클릭: {link.text.strip()} ({row_text[:30]}...)")
+                    rcep_no = link.text.strip()
+                    print(f"  📎 이력 클릭: {rcep_no}")
+                    link.click()
+                    time.sleep(3)
+                    # 팝업 닫고 메인 창으로 전환
+                    driver.close()  # 팝업 닫기
+                    driver.switch_to.window(main_window)
+                    print(f"  🔍 메인 창 URL: {driver.current_url}")
                     break
-                except Exception:
+                except Exception as ex:
+                    print(f"  ⚠️ 이력 행 클릭 오류: {ex}")
                     continue
     except Exception as e:
         print(f"  ⚠️ 기관이력 파싱 오류: {e}")
-
-    driver.close()
-    driver.switch_to.window(main_window)
-
-    if not target_href:
-        print("  ℹ️ 해당 이력 없음")
+        for h in list(driver.window_handles):
+            if h != main_window:
+                driver.switch_to.window(h)
+                driver.close()
+        driver.switch_to.window(main_window)
         return evaluators
 
-    # 이력 상세 페이지 열기
-    driver.execute_script(f"window.open('{target_href}', '_blank')")
-    switch_to_popup(driver, main_window)
-    time.sleep(1.5)
+    time.sleep(1)
 
-    # 현장평가 처리완료 행의 링크 찾기
-    eval_href = None
+    # 3. 새 창에서 goProcSttus 링크 찾아 클릭 → 또 새 창으로 열림
     try:
-        rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
-        for row in rows:
-            cells = row.find_elements(By.TAG_NAME, "td")
-            if len(cells) < 2:
-                continue
-            진행단계 = cells[0].text.strip()
-            처리상태 = cells[1].text.strip()
-            if "현장평가" in 진행단계 and "처리완료" in 처리상태:
-                try:
-                    eval_href = cells[0].find_element(By.TAG_NAME, "a").get_attribute("href")
-                    print("  ✅ 현장평가 처리완료 확인")
-                    break
-                except Exception:
-                    pass
-    except Exception as e:
-        print(f"  ⚠️ 이력 상세 파싱 오류: {e}")
-
-    driver.close()
-    driver.switch_to.window(main_window)
-
-    if not eval_href:
-        print("  ℹ️ 현장평가 처리완료 없음")
+        plan_link = driver.find_element(By.XPATH, "//a[contains(@href,'goProcSttus') and contains(text(),'평가계획서')]")
+        href = plan_link.get_attribute("href")
+        print(f"  ✅ 평가계획서 클릭")
+        before2 = set(driver.window_handles)
+        driver.execute_script(href.replace("javascript:", ""))
+        time.sleep(2)
+        after2 = set(driver.window_handles)
+        new_win = after2 - before2
+        print(f"  🔍 평가계획서 후 창 수: {len(driver.window_handles)}, 새창: {len(new_win)}")
+        if new_win:
+            driver.switch_to.window(list(new_win)[0])
+        print(f"  🔍 평가계획서 창 URL: {driver.current_url}")
+        evaluators = _extract_evaluators(driver)
+        print(f"  👥 직전평가반: {evaluators}")
+        for h in list(driver.window_handles):
+            if h != main_window:
+                driver.switch_to.window(h)
+                driver.close()
+        driver.switch_to.window(main_window)
         return evaluators
+    except Exception as e:
+        print(f"  ⚠️ 평가계획서 클릭 오류: {e}")
 
-    # 현장평가 상세에서 평가반 성명 수집
-    driver.execute_script(f"window.open('{eval_href}', '_blank')")
-    switch_to_popup(driver, main_window)
-    time.sleep(1.5)
-
-    evaluators = _extract_evaluators(driver)
-    print(f"  👥 평가반: {evaluators}")
-
-    driver.close()
+    # 열린 창들 정리
+    for h in list(driver.window_handles):
+        if h != main_window:
+            driver.switch_to.window(h)
+            driver.close()
     driver.switch_to.window(main_window)
+
+    print("  ℹ️ 현장평가 평가계획서 없음")
     return evaluators
 
 
 def _extract_evaluators(driver):
     """
-    현장평가 상세 페이지에서 평가반 성명 추출.
-    테이블 구조: cells[0]=구분, cells[1]=소속, cells[2]=성명
-    구분에 반장/평가사/사보/위원/평가원 포함된 행만 수집.
+    평가계획서 페이지에서 평가반 성명 추출.
+    구조: 구분(1열) | 중분류(2열) | 성명(3열) | 소속(4열) ...
+    구분에 반장/평가사/사보/위원/평가원 포함된 행의 성명(3열) 수집
     """
     names = []
     구분_keywords = ["반장", "평가사", "사보", "위원", "평가원"]
     try:
-        rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
+        rows = driver.find_elements(By.CSS_SELECTOR, "table tr")
         for row in rows:
             cells = row.find_elements(By.TAG_NAME, "td")
             if len(cells) >= 3:
@@ -416,22 +408,38 @@ def get_consulting_info(driver):
     switch_to_popup(driver, main_window)
     time.sleep(1.5)
 
-    # 5년간심사자 셀에서 이름 추출 ("평가사 이름" 패턴)
+    # 5년간심사자 셀에서 이름 추출
+    # 패턴1: "심사반장:홍길동", "심사원:홍길동" 형태
+    # 패턴2: "KOLAS 선임평가사 홍길동" 형태
     try:
         cell_text = driver.find_element(
             By.XPATH, "//th[contains(text(),'5년간심사자')]/following-sibling::td"
         ).text
-        names = re.findall(r'(?:선임)?평가사\s+([가-힣]{2,4})', cell_text)
-        result["내부심사"] = names
+        # 패턴1: 심사반장/심사원: 뒤 이름
+        names = re.findall(r'(?:심사반장|심사원):([가-힣]{2,4})', cell_text)
+        if not names:
+            # 패턴2: "KOLAS 선임평가사 이름" 또는 "이름(KOLAS...)" 둘 다 처리
+            p2 = re.findall(r'(?:선임)?평가사\s+([가-힣]{2,4})', cell_text)
+            p3 = re.findall(r'([가-힣]{2,4})\s*\(KOLAS', cell_text)
+            names = p2 + p3
+        # 중복 제거 (순서 유지)
+        seen = set()
+        unique_names = []
+        for n in names:
+            if n not in seen:
+                seen.add(n)
+                unique_names.append(n)
+        result["내부심사"] = unique_names
     except Exception:
         pass
 
-    # 컨설팅 담당자 수집 (4번째 열, "없음" 제외)
+    # 컨설팅 담당자 수집
+    # tbody 각 행의 4번째 td(인덱스3)가 담당자명
     try:
         rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
         for row in rows:
             cells = row.find_elements(By.TAG_NAME, "td")
-            if len(cells) >= 4 and "컨설팅" in cells[1].text:
+            if len(cells) >= 4:
                 name = cells[3].text.strip()
                 if name and name != "없음":
                     result["컨설팅"].append(name)
@@ -501,6 +509,86 @@ def get_accredit_range(driver):
 
 
 
+
+# ════════════════════════════════════════════════════════════
+# STEP 5-3: 평가사 이름으로 검색 → 최근 평가이력(Ⅱ) 날짜 수집
+# ════════════════════════════════════════════════════════════
+def get_evaluator_recent_history(driver, name):
+    """
+    평가사관리 페이지에서 이름 검색 후 상세페이지 진입,
+    평가이력(Ⅱ) 최상단 날짜 반환.
+
+    검색창: id="searchUserName"
+    이름 링크: <a href="javascript:detail(숫자);">이름</a>
+    평가이력(Ⅱ): <h2 class="mt15">평가이력(Ⅱ)...</h2>
+    날짜 링크: <a href="javascript:HistoryInfo(숫자)">2025-08-06&nbsp;~&nbsp;2025-08-08</a>
+    """
+    EVALUATOR_URL = "https://www.knab.go.kr/usr/evm/EvlprInfoInqireList.do"
+
+    try:
+        driver.get(EVALUATOR_URL)
+        time.sleep(1.5)
+
+        # 이름 검색
+        search_box = driver.find_element(By.ID, "searchUserName")
+        search_box.clear()
+        search_box.send_keys(name)
+        driver.execute_script("search();")
+        time.sleep(2)
+
+        # 이름 링크 찾기 (javascript:detail(숫자))
+        links = driver.find_elements(By.XPATH, "//a[contains(@href,'detail') and text()='" + name + "']")
+        if not links:
+            # 이름이 정확히 일치 안할 수 있으니 포함으로도 시도
+            links = driver.find_elements(By.XPATH, f"//a[contains(@href,'detail') and contains(text(),'{name}')]")
+        if not links:
+            return ""
+
+        # 링크 클릭 → 새 창 또는 같은 창
+        main_window = driver.current_window_handle
+        links[0].click()
+        time.sleep(2)
+
+        # 새 창 열렸으면 전환
+        if len(driver.window_handles) > 1:
+            for handle in driver.window_handles:
+                if handle != main_window:
+                    driver.switch_to.window(handle)
+                    break
+
+        # 평가이력(Ⅱ) h2 찾고 그 다음 테이블의 첫 번째 날짜 링크
+        recent_date = ""
+        try:
+            # h2 태그 중 "평가이력(Ⅱ)" 포함된 것 찾기
+            h2_els = driver.find_elements(By.CSS_SELECTOR, "h2.mt15")
+            target_h2 = None
+            for h2 in h2_els:
+                if "평가이력" in h2.text and "Ⅱ" in h2.text:
+                    target_h2 = h2
+                    break
+
+            if target_h2:
+                # h2 다음 테이블의 첫 번째 HistoryInfo 링크
+                date_link = driver.find_element(
+                    By.XPATH,
+                    "//h2[contains(text(),'평가이력') and contains(text(),'Ⅱ')]"
+                    "/following::a[contains(@href,'HistoryInfo')][1]"
+                )
+                recent_date = date_link.text.replace(" ", " ").strip()
+        except Exception:
+            pass
+
+        # 창 정리
+        if len(driver.window_handles) > 1:
+            driver.close()
+            driver.switch_to.window(main_window)
+
+        return recent_date
+
+    except Exception as e:
+        print(f"    ⚠️ {name} 이력 조회 오류: {e}")
+        return ""
+
 # ════════════════════════════════════════════════════════════
 # STEP 5-2: 평가사관리 → 대분류/중분류별 엑셀 다운로드
 # ════════════════════════════════════════════════════════════
@@ -533,8 +621,8 @@ def download_evaluator_excels(driver, sheet_names):
             driver.get(EVALUATOR_URL)
             time.sleep(2)
 
-            # 1. 인정분류 = 시험(02)
-            Select(driver.find_element(By.ID, "accreditClss")).select_by_value("02")
+            # 1. 인정분류 = 교정(02)
+            Select(driver.find_element(By.ID, "accreditClss")).select_by_value("01")
             time.sleep(1)
 
             # 2. 대분류 선택 (onchange로 중분류 목록 동적 로드)
@@ -690,46 +778,7 @@ def fill_excel(data):
     ws = wb["1안"]  # '1안' 시트에 입력
 
     # 기본 정보
-    ws["B3"] = 기관명
-    ws["D3"] = 평가종류
-
-    # 내부심사자 (최대 2명)
-    심사자 = data.get("내부심사", [])
-    ws["B4"] = 심사자[0] if len(심사자) > 0 else ""
-    ws["C4"] = 심사자[1] if len(심사자) > 1 else ""
-
-    # 컨설팅 담당자
-    컨설팅 = data.get("컨설팅", [])
-    ws["B5"] = 컨설팅[0] if 컨설팅 else ""
-
-    # 직전 평가반 (B6~H6, 최대 7명)
-    cols  = ["B", "C", "D", "E", "F", "G", "H"]
-    평가반 = data.get("직전평가반", [])
-    for i, col in enumerate(cols):
-        ws[f"{col}6"] = 평가반[i] if i < len(평가반) else ""
-
-    # 평가일
-    ws["B7"] = data.get("평가시작일", "")
-    ws["C7"] = data.get("평가종료일", "")
-
-    # 기관 담당자 정보 (병합 셀 대응: 병합 해제 후 쓰고 다시 병합)
-    def write_merged(ws, cell_addr, value):
-        """병합 셀 포함 여부와 무관하게 값 쓰기"""
-        from openpyxl.utils import coordinate_to_tuple
-        row, col = coordinate_to_tuple(cell_addr)
-        # 해당 셀이 병합 범위에 포함되어 있으면 병합 해제 후 쓰기
-        for merge in list(ws.merged_cells.ranges):
-            if merge.min_row <= row <= merge.max_row and merge.min_col <= col <= merge.max_col:
-                ws.unmerge_cells(str(merge))
-                ws.merge_cells(str(merge))  # 다시 병합
-                break
-        ws[cell_addr] = value
-
-    # 병합 셀이 있어도 강제로 값 쓰기
-    for merge in list(ws.merged_cells.ranges):
-        pass  # 병합 정보 확인용
-
-    # openpyxl 병합 셀은 unmerge 후 write 후 re-merge
+    # 병합 셀 안전 쓰기 함수
     def safe_write(ws, cell_addr, value):
         from openpyxl.utils import coordinate_to_tuple
         row, col = coordinate_to_tuple(cell_addr)
@@ -744,6 +793,34 @@ def fill_excel(data):
             ws.merge_cells(target_merge)
         else:
             ws[cell_addr] = value
+
+    ws["B3"] = 기관명
+    ws["D3"] = 평가종류
+
+    # 내부심사자 (B4부터 옆으로 계속)
+    심사자 = data.get("내부심사", [])
+    cols_4 = ["B","C","D","E","F","G","H","I","J","K"]
+    for i, 이름 in enumerate(심사자):
+        if i < len(cols_4):
+            safe_write(ws, f"{cols_4[i]}4", 이름)
+
+    # 컨설팅 담당자 (B5부터 옆으로 계속)
+    컨설팅 = data.get("컨설팅", [])
+    for i, 이름 in enumerate(컨설팅):
+        if i < len(cols_4):
+            safe_write(ws, f"{cols_4[i]}5", 이름)
+
+    # 직전 평가반 (B6~H6, 최대 7명)
+    cols  = ["B", "C", "D", "E", "F", "G", "H"]
+    평가반 = data.get("직전평가반", [])
+    for i, col in enumerate(cols):
+        ws[f"{col}6"] = 평가반[i] if i < len(평가반) else ""
+
+    # 평가일
+    ws["B7"] = data.get("평가시작일", "")
+    ws["C7"] = data.get("평가종료일", "")
+
+
 
     safe_write(ws, "B14", data.get("담당자명", ""))
     safe_write(ws, "B15", data.get("담당자연락처", ""))
@@ -793,16 +870,27 @@ def fill_excel(data):
                 if 대분류 and 중분류:
                     sheet_names.add(f"{대분류}.{중분류}")
 
-            for sheet_name in sorted(sheet_names):
-                if sheet_name not in wb.sheetnames:
-                    wb.create_sheet(title=sheet_name)
-                    print(f"  📄 시트 생성: {sheet_name}")
-
             # 평가사관리에서 각 시트별 엑셀 다운로드 후 시트에 붙여넣기
             evaluator_files = data.get("평가사파일들", {})
-            for sheet_name, eval_file in evaluator_files.items():
+            sheet_names_sorted = sorted(sheet_names)
+            for i, sheet_name in enumerate(sheet_names_sorted):
+                # 1. 시트 생성
                 if sheet_name not in wb.sheetnames:
-                    wb.create_sheet(title=sheet_name)
+                    if i == 0:
+                        wb["Sheet1"].title = sheet_name
+                        print(f"  📄 시트 이름 변경: Sheet1 → {sheet_name}")
+                    else:
+                        from copy import copy
+                        source = wb[sheet_names_sorted[0]]
+                        new_ws = wb.copy_worksheet(source)
+                        new_ws.title = sheet_name
+                        for row in new_ws.iter_rows(min_row=2):
+                            for cell in row:
+                                cell.value = None
+                        print(f"  📄 시트 복사 생성: {sheet_name}")
+
+                # 2. 해당 시트에 맞는 평가사 파일 붙여넣기
+                eval_file = evaluator_files.get(sheet_name)
                 if not eval_file or not os.path.exists(eval_file):
                     continue
                 try:
@@ -810,42 +898,41 @@ def fill_excel(data):
                     wb_eval = xlrd.open_workbook(eval_file)
                     ws_src = wb_eval.sheet_by_index(0)
 
-                    # 1행(헤더 포함) 전체 복사 + 모든 셀 HTML 태그 제거
-                    for r_idx in range(ws_src.nrows):
-                        for c_idx in range(ws_src.ncols):
-                            val = ws_src.cell_value(r_idx, c_idx)
-                            if isinstance(val, str):
-                                # <br />, <br/, <br 등 닫히지 않은 태그도 제거
-                                val = re.sub(r'<[^>]*>?', '', val).strip()
-                            ws_eval.cell(row=r_idx+1, column=c_idx+1, value=val)
+                    # 사이트 엑셀 → 템플릿 열 매핑
+                    # C(3)→A(1), D(4)→B(2), G(7)→C(3), P(16)→D(4), K(11)→E(5)
+                    col_map = {3: 1, 4: 2, 7: 3, 16: 4, 11: 5}
 
-                    # 1행에 필터 추가
+                    data_rows = 0
+                    for r_idx in range(1, ws_src.nrows):
+                        row_has_data = False
+                        for src_col, dst_col in col_map.items():
+                            val = ws_src.cell_value(r_idx, src_col - 1)  # xlrd는 0-based
+                            if isinstance(val, str):
+                                val = re.sub(r'<[^>]*>?', '', val).strip()
+                            # 평가사구분 변환: 시험:평가사보 → 평가사보
+                            if dst_col == 3:
+                                m = re.search(r'시험[:;,](선임평가사|평가사보|평가사)', str(val))
+                                if m:
+                                    val = m.group(1)
+                            ws_eval.cell(row=r_idx + 1, column=dst_col, value=val)
+                            if val:
+                                row_has_data = True
+                        if row_has_data:
+                            data_rows += 1
+
                     ws_eval.auto_filter.ref = ws_eval.dimensions
 
-                    # F열(컬럼6) 변환: "시험:선임평가사,교정:평가사" → "선임평가사"
-                    # 여러 값 중 "시험:" 포함된 항목만 찾아서 ":" 뒤 텍스트 추출
-                    for r_idx in range(1, ws_src.nrows):
-                        cell = ws_eval.cell(row=r_idx+1, column=6)
-                        val = str(cell.value or "")
-                        if not val:
-                            continue
-                        # "시험:선임평가사", "시험:평가사", "시험:평가사보" 중 하나 찾아서 시험: 제거
-                        m = re.search(r'시험[:;,](선임평가사|평가사보|평가사)', val)
-                        if m:
-                            cell.value = m.group(1)
+                    # 특정 이름 목록에 있으면 B열(성명) 빨간색 표시
+                    from openpyxl.styles import PatternFill, Font
+                    red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+                    red_font = Font(color="FF0000", bold=True)
+                    red_names = set(["강민철","고우성","김경식","김경희","김남진","김진규","김진수","김태성","김하동","김학영","김희수","박갑동","박경환","박덕우","박상철","송지훈","심규창","안완식","안장혁","엄석원","오상만","유덕룡","유찬주","육선우","이규배","이명수","이상문","이석기","이승덕","이영규","이종대","이창수","장성우","장태연","주정우","조대흥","차영섭","최성진","탁계성","황병옥","황수환"])
+                    for r_idx in range(2, ws_eval.max_row + 1):
+                        name_cell = ws_eval.cell(row=r_idx, column=2)  # B열=성명
+                        if name_cell.value and str(name_cell.value).strip() in red_names:
+                            name_cell.font = red_font
 
-                    # 불필요한 열 삭제
-                    # 남길 열(원본): B(2)등록일, C(3)회사기관명, D(4)성명, F(6)평가사구분, J(10)시험유효, K(11)검사유효
-                    keep_cols = {3, 4, 6, 10, 11}  # 등록일(2) 제외
-                    # 삭제할 열 목록을 미리 확정 후 뒤에서부터 삭제
-                    delete_cols = sorted([c for c in range(1, ws_eval.max_column + 1) if c not in keep_cols], reverse=True)
-                    for col_idx in delete_cols:
-                        ws_eval.delete_cols(col_idx)
-
-                    # 열 삭제 후 G1에 "최근평가" 헤더 추가 (6번째 열 다음 = 7번째)
-                    ws_eval.cell(row=1, column=7, value="최근평가")
-
-                    print(f"  📋 시트 [{sheet_name}] {ws_src.nrows}행 복사 완료")
+                    print(f"  📋 시트 [{sheet_name}] {data_rows}행 복사 완료")
                 except Exception as e:
                     print(f"  ⚠️ 시트 [{sheet_name}] 복사 오류: {e}")
 

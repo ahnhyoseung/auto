@@ -64,13 +64,13 @@
 #   - C:\Users\user\Downloads 에서 *TestingRangeList*.xls* 중 가장 최근 파일 사용
 #
 # [설치 명령]
-#   pip install selenium openpyxl webdriver-manager xlrd
+#   pip install requirements.txt
 #
 # [파일 구조]
 #   C:\ahn\
-#     ├── ahn.py          ← 이 스크립트
+#     ├── seung.py          ← 이 스크립트
 #     ├── template.xlsx   ← 양식 파일 ('1안' 시트 포함)
-#     └── ahnhyoseung\    ← 결과 저장 폴더 (자동 생성)
+#     └── ahnhyoseung\    ← 결과 저장 디렉토리 (자동 생성)
 # ============================================================
 
 import re
@@ -500,6 +500,77 @@ def get_accredit_range(driver):
     return latest
 
 
+
+# ════════════════════════════════════════════════════════════
+# STEP 5-2: 평가사관리 → 대분류/중분류별 엑셀 다운로드
+# ════════════════════════════════════════════════════════════
+def download_evaluator_excels(driver, sheet_names):
+    """
+    평가사관리 페이지에서 시트명 목록(예: ["03.014", "02.017"])을 받아
+    각 대분류/중분류 드롭다운 설정 → 검색 → 엑셀 다운로드.
+
+    드롭다운:
+      accreditClss: 인정분류 (항상 "02"=시험)
+      searchBigId:  대분류 코드 (onchange로 중분류 동적 로드됨)
+      searchMiddleId: 중분류 코드
+    엑셀 버튼: onclick="download()"
+
+    반환: {"03.014": "C:/Users/user/Downloads/xxx.xls", ...}
+    """
+    EVALUATOR_URL = "https://www.knab.go.kr/usr/evm/EvlprInfoInqireList.do"
+    downloaded = {}
+
+    for sheet_name in sorted(sheet_names):
+        parts = sheet_name.split(".")
+        if len(parts) != 2:
+            continue
+        대분류코드 = parts[0]  # 예: "03"
+        중분류코드 = parts[1]  # 예: "014"
+
+        print(f"  🔍 평가사 검색: {sheet_name}")
+
+        try:
+            driver.get(EVALUATOR_URL)
+            time.sleep(2)
+
+            # 1. 인정분류 = 시험(02)
+            Select(driver.find_element(By.ID, "accreditClss")).select_by_value("02")
+            time.sleep(1)
+
+            # 2. 대분류 선택 (onchange로 중분류 목록 동적 로드)
+            Select(driver.find_element(By.ID, "searchBigId")).select_by_value(대분류코드)
+            time.sleep(1.5)  # 중분류 목록 로드 대기
+
+            # 3. 중분류 선택
+            Select(driver.find_element(By.ID, "searchMiddleId")).select_by_value(중분류코드)
+            time.sleep(0.5)
+
+            # 4. 검색
+            driver.execute_script("search();")
+            time.sleep(2)
+
+            # 5. 다운로드 전 기존 파일 목록 스냅샷
+            before = set(glob.glob(os.path.join(DOWNLOAD_DIR, "*.xls*")))
+
+            # 6. 엑셀 다운로드
+            driver.execute_script("download();")
+            time.sleep(4)
+
+            # 7. 새로 생긴 파일 찾기
+            after = set(glob.glob(os.path.join(DOWNLOAD_DIR, "*.xls*")))
+            new_files = after - before
+            if new_files:
+                latest = max(new_files, key=os.path.getmtime)
+                downloaded[sheet_name] = latest
+                print(f"    ✅ 다운로드: {os.path.basename(latest)}")
+            else:
+                print(f"    ⚠️ 다운로드 파일 없음: {sheet_name}")
+
+        except Exception as e:
+            print(f"    ⚠️ 평가사 검색 오류 ({sheet_name}): {e}")
+
+    return downloaded
+
 # ════════════════════════════════════════════════════════════
 # STEP 6: 기관정보 팝업 → 기관명, 담당자정보, 사업장주소 수집
 # ════════════════════════════════════════════════════════════
@@ -545,32 +616,40 @@ def get_agency_info(driver):
             ths = row.find_elements(By.TAG_NAME, "th")
             tds = row.find_elements(By.TAG_NAME, "td")
 
-            # 사업장 rowspan th 감지: "사\n업\n장" → replace로 "사업장"
+            # 사업장 rowspan th 감지
             for th in ths:
                 th_text = th.text.replace("\n", "").replace(" ", "")
                 if "사업장" in th_text:
                     in_company_section = True
 
+            # th/td가 같은 행에 있는 경우 (기관명, 주소 등)
             for th in ths:
                 label = th.text.replace("\n", "").strip()
-                # th 바로 다음 td 가져오기 (following-sibling)
                 try:
                     td = th.find_element(By.XPATH, "following-sibling::td[1]")
                     val = td.text.strip()
                 except Exception:
-                    val = tds[0].text.strip() if tds else ""
+                    val = ""
 
                 if "기관명" in label and not result["기관명"] and "영문" not in label:
                     result["기관명"] = val
-                elif "담당자명" in label:
-                    result["담당자명"] = val
-                elif "담당자연락처" in label or ("연락처" in label and "담당" in label):
-                    result["담당자연락처"] = val
-                elif "담당자이메일" in label or ("이메일" in label and "담당" in label):
-                    result["담당자이메일"] = val
                 elif label == "주소" and in_company_section and not result["주소"]:
-                    # 사업장 섹션의 첫 번째 "주소"만 수집 (법인 주소 제외)
                     result["주소"] = val
+
+            # 담당자명/연락처/이메일: 모두 같은 tr 안에 th + td 함께 있음
+            # <tr><th>담당자명</th><td>류제형</td></tr>
+            for th in ths:
+                label = th.text.replace("\n", "").strip()
+                try:
+                    val = th.find_element(By.XPATH, "following-sibling::td[1]").text.strip()
+                except Exception:
+                    val = ""
+                if "담당자명" in label and not result["담당자명"]:
+                    result["담당자명"] = val
+                elif "담당자연락처" in label:
+                    result["담당자연락처"] = val
+                elif "담당자이메일" in label:
+                    result["담당자이메일"] = val
 
     except Exception as e:
         print(f"  ⚠️ 기관정보 파싱 오류: {e}")
@@ -633,11 +712,53 @@ def fill_excel(data):
     ws["B7"] = data.get("평가시작일", "")
     ws["C7"] = data.get("평가종료일", "")
 
-    # 기관 담당자 정보
-    ws["B14"] = data.get("담당자명", "")
-    ws["B15"] = data.get("담당자연락처", "")
-    ws["B16"] = data.get("담당자이메일", "")
-    ws["F14"] = data.get("주소", "")  # 사업장 주소
+    # 기관 담당자 정보 (병합 셀 대응: 병합 해제 후 쓰고 다시 병합)
+    def write_merged(ws, cell_addr, value):
+        """병합 셀 포함 여부와 무관하게 값 쓰기"""
+        from openpyxl.utils import coordinate_to_tuple
+        row, col = coordinate_to_tuple(cell_addr)
+        # 해당 셀이 병합 범위에 포함되어 있으면 병합 해제 후 쓰기
+        for merge in list(ws.merged_cells.ranges):
+            if merge.min_row <= row <= merge.max_row and merge.min_col <= col <= merge.max_col:
+                ws.unmerge_cells(str(merge))
+                ws.merge_cells(str(merge))  # 다시 병합
+                break
+        ws[cell_addr] = value
+
+    # 병합 셀이 있어도 강제로 값 쓰기
+    for merge in list(ws.merged_cells.ranges):
+        pass  # 병합 정보 확인용
+
+    # openpyxl 병합 셀은 unmerge 후 write 후 re-merge
+    def safe_write(ws, cell_addr, value):
+        from openpyxl.utils import coordinate_to_tuple
+        row, col = coordinate_to_tuple(cell_addr)
+        target_merge = None
+        for merge in list(ws.merged_cells.ranges):
+            if merge.min_row <= row <= merge.max_row and merge.min_col <= col <= merge.max_col:
+                target_merge = str(merge)
+                break
+        if target_merge:
+            ws.unmerge_cells(target_merge)
+            ws[cell_addr] = value
+            ws.merge_cells(target_merge)
+        else:
+            ws[cell_addr] = value
+
+    safe_write(ws, "B14", data.get("담당자명", ""))
+    safe_write(ws, "B15", data.get("담당자연락처", ""))
+    safe_write(ws, "B16", data.get("담당자이메일", ""))
+    safe_write(ws, "F14", data.get("주소", ""))
+
+    # 평가반구성 (10행부터): B=역할, C=소속, D=성명, E=연락처
+    # 기존 내용 먼저 클리어
+    평가반구성 = data.get("평가반구성", [])
+    for i, 멤버 in enumerate(평가반구성):
+        row = 10 + i
+        safe_write(ws, f"B{row}", 멤버.get("소속", ""))
+        safe_write(ws, f"C{row}", 멤버.get("성명", ""))
+        safe_write(ws, f"D{row}", 멤버.get("연락처", ""))
+        safe_write(ws, f"E{row}", 멤버.get("이메일", ""))
 
     # 인정분야 데이터 붙여넣기 + 대분류.중분류 시트 생성
     range_file = data.get("인정분야파일", None)
@@ -646,6 +767,11 @@ def fill_excel(data):
             # xlrd로 .xls 파일 읽기 (openpyxl은 .xls 미지원)
             wb_range = xlrd.open_workbook(range_file)
             ws_range = wb_range.sheet_by_index(0)
+
+            # 기존 데이터 클리어: 19행부터 끝까지 비우기 (이전 데이터 잔존 방지)
+            for r in ws.iter_rows(min_row=19, max_row=ws.max_row):
+                for cell in r:
+                    cell.value = None
 
             # '1안' 시트 19행부터 붙여넣기 (xls 2행=인덱스1부터, 1행은 헤더)
             start_row = 19
@@ -671,6 +797,57 @@ def fill_excel(data):
                 if sheet_name not in wb.sheetnames:
                     wb.create_sheet(title=sheet_name)
                     print(f"  📄 시트 생성: {sheet_name}")
+
+            # 평가사관리에서 각 시트별 엑셀 다운로드 후 시트에 붙여넣기
+            evaluator_files = data.get("평가사파일들", {})
+            for sheet_name, eval_file in evaluator_files.items():
+                if sheet_name not in wb.sheetnames:
+                    wb.create_sheet(title=sheet_name)
+                if not eval_file or not os.path.exists(eval_file):
+                    continue
+                try:
+                    ws_eval = wb[sheet_name]
+                    wb_eval = xlrd.open_workbook(eval_file)
+                    ws_src = wb_eval.sheet_by_index(0)
+
+                    # 1행(헤더 포함) 전체 복사 + 모든 셀 HTML 태그 제거
+                    for r_idx in range(ws_src.nrows):
+                        for c_idx in range(ws_src.ncols):
+                            val = ws_src.cell_value(r_idx, c_idx)
+                            if isinstance(val, str):
+                                # <br />, <br/, <br 등 닫히지 않은 태그도 제거
+                                val = re.sub(r'<[^>]*>?', '', val).strip()
+                            ws_eval.cell(row=r_idx+1, column=c_idx+1, value=val)
+
+                    # 1행에 필터 추가
+                    ws_eval.auto_filter.ref = ws_eval.dimensions
+
+                    # F열(컬럼6) 변환: "시험:선임평가사,교정:평가사" → "선임평가사"
+                    # 여러 값 중 "시험:" 포함된 항목만 찾아서 ":" 뒤 텍스트 추출
+                    for r_idx in range(1, ws_src.nrows):
+                        cell = ws_eval.cell(row=r_idx+1, column=6)
+                        val = str(cell.value or "")
+                        if not val:
+                            continue
+                        # "시험:선임평가사", "시험:평가사", "시험:평가사보" 중 하나 찾아서 시험: 제거
+                        m = re.search(r'시험[:;,](선임평가사|평가사보|평가사)', val)
+                        if m:
+                            cell.value = m.group(1)
+
+                    # 불필요한 열 삭제
+                    # 남길 열(원본): B(2)등록일, C(3)회사기관명, D(4)성명, F(6)평가사구분, J(10)시험유효, K(11)검사유효
+                    keep_cols = {3, 4, 6, 10, 11}  # 등록일(2) 제외
+                    # 삭제할 열 목록을 미리 확정 후 뒤에서부터 삭제
+                    delete_cols = sorted([c for c in range(1, ws_eval.max_column + 1) if c not in keep_cols], reverse=True)
+                    for col_idx in delete_cols:
+                        ws_eval.delete_cols(col_idx)
+
+                    # 열 삭제 후 G1에 "최근평가" 헤더 추가 (6번째 열 다음 = 7번째)
+                    ws_eval.cell(row=1, column=7, value="최근평가")
+
+                    print(f"  📋 시트 [{sheet_name}] {ws_src.nrows}행 복사 완료")
+                except Exception as e:
+                    print(f"  ⚠️ 시트 [{sheet_name}] 복사 오류: {e}")
 
         except Exception as e:
             print(f"  ⚠️ 인정분야 복사 오류: {e}")
@@ -727,6 +904,29 @@ def main():
                 except Exception:
                     pass
 
+                # 평가반구성 및 업무분장: 상세페이지 본문에서 직접 수집
+                평가반구성 = []
+                try:
+                    level_els  = driver.find_elements(By.CSS_SELECTOR, "select[name='assessorLevel']")
+                    name_els   = driver.find_elements(By.CSS_SELECTOR, "input[name='assessorNameArr']")
+                    office_els = driver.find_elements(By.CSS_SELECTOR, "input[name='assessorOfficeArr']")
+                    phone_els  = driver.find_elements(By.CSS_SELECTOR, "input[name='assessorPhoneArr']")
+                    email_els  = driver.find_elements(By.CSS_SELECTOR, "input[name='assessorEmailArr']")
+                    for i in range(len(name_els)):
+                        try:
+                            역할 = level_els[i].find_element(By.CSS_SELECTOR, "option[selected]").text.strip() if i < len(level_els) else ""
+                        except Exception:
+                            역할 = ""
+                        성명 = name_els[i].get_attribute("value").strip()
+                        소속 = office_els[i].get_attribute("value").strip() if i < len(office_els) else ""
+                        연락처 = phone_els[i].get_attribute("value").strip() if i < len(phone_els) else ""
+                        이메일 = email_els[i].get_attribute("value").strip() if i < len(email_els) else ""
+                        if 성명:
+                            평가반구성.append({"역할": 역할, "소속": 소속, "성명": 성명, "연락처": 연락처, "이메일": 이메일})
+                    print(f"  👥 평가반구성: {len(평가반구성)}명")
+                except Exception as e:
+                    print(f"  ⚠️ 평가반구성 수집 오류: {e}")
+
                 # 팝업 수집 순서 (이 순서 중요!)
                 # 상세 페이지는 POST 방식이라 팝업 닫고 URL 재접근 불가
                 # 따라서 모든 팝업을 한 번의 상세페이지 진입 상태에서 처리
@@ -743,6 +943,25 @@ def main():
                 # 4. 기관이력보기 팝업 → 직전 평가반 (마지막 수행)
                 evaluators = get_history_evaluators(driver, accredit)
 
+                # 5. 평가사관리 페이지에서 대분류.중분류별 평가사 엑셀 다운로드
+                # (인정분야 xls에서 추출한 sheet_names 사용)
+                평가사파일들 = {}
+                if range_file and os.path.exists(range_file):
+                    try:
+                        wb_tmp = xlrd.open_workbook(range_file)
+                        ws_tmp = wb_tmp.sheet_by_index(0)
+                        sheet_names_tmp = set()
+                        for r in range(1, ws_tmp.nrows):
+                            대v = ws_tmp.cell_value(r, 1)
+                            중v = ws_tmp.cell_value(r, 3)
+                            대 = str(int(float(대v))).zfill(2) if 대v else ""
+                            중 = str(int(float(중v))).zfill(3) if 중v else ""
+                            if 대 and 중:
+                                sheet_names_tmp.add(f"{대}.{중}")
+                        평가사파일들 = download_evaluator_excels(driver, sheet_names_tmp)
+                    except Exception as e:
+                        print(f"  ⚠️ 평가사 다운로드 준비 오류: {e}")
+
                 data = {
                     "기관명":       agency.get("기관명", ""),
                     "평가종류":     평가종류,
@@ -756,6 +975,8 @@ def main():
                     "담당자이메일": agency.get("담당자이메일", ""),
                     "주소":         agency.get("주소", ""),
                     "인정분야파일": range_file,
+                    "평가사파일들":  평가사파일들,
+                    "평가반구성":   평가반구성,
                 }
 
                 print(f"  기관명:     {data['기관명']}")
