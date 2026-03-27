@@ -1023,7 +1023,7 @@ def fill_excel(data):
                                 end_date = val
                             else:
                                 continue
-                            if today <= end_date <= six_months_later:
+                            if end_date <= six_months_later:
                                 ws_eval.cell(row=r_idx, column=8).value = "x유효기간"  # H열
                         except Exception:
                             continue
